@@ -1,99 +1,103 @@
 🏭 Cross-Process Quality Prediction – JK Cement
 
-This Streamlit web app predicts cement strength (28-day MPa) by integrating data across Raw Mix, Clinker, and Grinding processes.
-It helps process engineers simulate process parameters, analyze model predictions, and understand feature influences using SHAP explainability, enabling real-time cement quality optimization.
+Full-stack application for predicting 28-day cement strength by integrating Raw Mix, Kiln, and Grinding process data.
 
-🚀 Features
+## Architecture Overview
 
-✅ Upload fused multi-silo dataset (CSV)
-✅ Auto-train or load Random Forest model (jk_quality_rf.joblib)
-✅ Display MAE, MSE, and R² model performance metrics
-✅ Simulate process parameters through sliders
-✅ Predict 28-day cement strength (MPa)
-✅ Interpret quality level (Low / Standard / High / Excellent)
-✅ Explain predictions using SHAP waterfall plots
-✅ Provide AI-based suggestions to improve strength
+- **Backend**: FastAPI service (`main.py`) offering endpoints for dataset ingestion, model training, strength prediction, SHAP explanations, and operator guidance.
+- **Frontend**: React (Vite) single-page app that mirrors the former Streamlit experience with richer visualisations and UX polish.
+- **Model Persistence**: Random Forest stored as `jk_quality_rf.joblib`, alongside training metadata required for SHAP analysis.
 
-🧠 Machine Learning Overview
+## Features
 
-Input Features:
+- CSV upload with schema validation across all process silos
+- Background RandomForest training or hot-loading of existing model artefact
+- Performance metrics (MAE, MSE, R²) surfaced to the UI
+- Interactive parameter sliders for Raw Mix, Kiln, and Grinding stages
+- Real-time strength prediction with quality banding and emoji cues
+- SHAP contributions for explainable AI insights
+- Operator guidance suggesting directional parameter adjustments toward a target strength
 
-limestone_pct, silica_pct, al2o3_pct, fe2o3_pct, lsf,
-kiln_temp, fuel_rate, o2, cooling_rate, blaine, mill_power
+## Getting Started
 
+### 1. Backend (FastAPI)
 
-Target Variable:
-strength_28d → 28-day compressive strength (MPa)
-
-Model Used:
-RandomForestRegressor (n_estimators=200, random_state=7)
-
-Performance Metrics:
-
-MAE (Mean Absolute Error)
-
-MSE (Mean Squared Error)
-
-R² Score
-
-
-
-
-
-2️⃣ Install dependencies
-
-If you already have requirements.txt, simply run:
-
+```bash
+cd /Users/yashree/Desktop/cementui/Cement_strength_prediction
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
+uvicorn main:app --reload --port 8000
+```
 
-3️⃣ Launch the Streamlit app
-streamlit run app.py
+### 2. Frontend (React)
 
-4️⃣ Upload your dataset
+```bash
+cd /Users/yashree/Desktop/cementui/Cement_strength_prediction/frontend
+npm install
+npm run dev -- --port 5173
+```
 
-Upload your fused dataset (CSV) containing all required columns through the sidebar.
+The React app expects the backend on `http://localhost:8000`. Update `.env` in `frontend` if you host elsewhere.
 
-📊 Example Input Ranges
-Process	Parameter	Range
-Raw Mix	Limestone %	70 – 90
-	Silica %	3 – 8
-	Al₂O₃ %	1 – 3.5
-	Fe₂O₃ %	1 – 3
-	LSF	Auto-calculated
-Kiln	Temp (°C)	1350 – 1500
-	Fuel Rate (t/hr)	3.5 – 6
-	O₂ (%)	3 – 6
-	Cooling Rate	2 – 5
-Grinding	Blaine	280 – 360
-	Mill Power (kW)	1500 – 3500
-📈 SHAP Explainability
+### 3. Usage Flow
 
-Red bars: Features that increase predicted strength
+1. Upload the fused multi-silo CSV via the “Dataset” card. The backend trains (or fine-tunes) the model and returns metrics plus a preview sample.
+2. Adjust process sliders or input fields in the “Simulation” panel. Inputs automatically populate the `lsf` feature when omitted.
+3. Submit for prediction to view strength, quality class, SHAP contributions, and top adjustment suggestions.
 
-Blue bars: Features that decrease predicted strength
+## API Reference
 
-Enables data-driven adjustments to maintain target quality.
+| Endpoint | Method | Description |
+| --- | --- | --- |
+| `/health` | GET | Service heartbeat (`ready` / `waiting_for_data`) |
+| `/config` | GET | Slider metadata, feature names, latest metrics, and sample rows |
+| `/train` | POST (multipart) | Upload CSV to (re)train the Random Forest and refresh explainability artefacts |
+| `/predict` | POST (JSON) | Predict strength, return SHAP contributions and operator suggestions |
 
-🧭 AI Suggestions
+### Request/Response Highlights
 
-After prediction, the app:
+- **/train** accepts `file: CSV`. Response includes metrics, feature order, and sample records.
+- **/predict** expects:
+  ```json
+  {
+    "limestone_pct": 80.0,
+    "silica_pct": 5.0,
+    "al2o3_pct": 2.0,
+    "fe2o3_pct": 2.0,
+    "kiln_temp": 1425,
+    "fuel_rate": 4.5,
+    "o2": 4.5,
+    "cooling_rate": 3.2,
+    "blaine": 320,
+    "mill_power": 2200,
+    "target_strength": 4.0
+  }
+  ```
+  The backend auto-computes `lsf` if omitted and responds with prediction, quality label, SHAP base value, ranked contributions, and human-readable suggestions.
 
-Identifies top 3 influencing parameters via SHAP values
+## Data Schema
 
-Suggests whether to increase or decrease them
+Required columns in the uploaded dataset:
 
-Helps achieve a target strength interactively
+```
+limestone_pct, silica_pct, al2o3_pct, fe2o3_pct, lsf,
+kiln_temp, fuel_rate, o2, cooling_rate, blaine, mill_power,
+strength_28d
+```
 
-🧰 Technologies Used
-Component	Technology
-UI	Streamlit
-ML	Scikit-learn (Random Forest)
-Explainability	SHAP
-Data Handling	Pandas, NumPy
-Visualization	Matplotlib
-Model Storage	Joblib
-🧑‍💻 Author
+Maintaining column names and units ensures seamless ingestion and accurate predictions.
 
-Developed by: Sadiq Basha
-Project: Cross-Process Optimization for Cement Quality
-Stack: Python • Streamlit • ML • SHAP
+## Tech Stack
+
+- **Backend**: FastAPI, scikit-learn, pandas, shap
+- **Frontend**: React, Vite, TypeScript, custom CSS styling
+- **Tooling**: Joblib for persistence, Uvicorn for ASGI serving
+
+## Development Notes
+
+- The SHAP explainer is re-generated on every training session and cached with the model artefact for consistent predictions across server restarts.
+- Quality thresholds mirror the original Streamlit logic; adjust `_strength_classification` in `main.py` for different bands.
+- Frontend environment variables live in `frontend/.env` (see sample file). Update `VITE_API_BASE_URL` to target a remote backend.
+
+Happy optimizing! 💪

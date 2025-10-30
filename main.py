@@ -1,153 +1,316 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import os
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+import io
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
 import joblib
+import numpy as np
+import pandas as pd
 import shap
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.model_selection import train_test_split
 
-st.set_page_config(page_title="Cross-Process Quality Prediction - JK Cement", layout="wide")
-st.title("🏭 Cross-Process Quality Prediction (Raw Mix → Clinker → Cement Quality)")
 
-st.sidebar.header("📂 Upload Dataset")
-uploaded_file = st.sidebar.file_uploader("Upload fused multi-silo dataset (CSV)", type=["csv"])
-
-if uploaded_file is not None:
-    data = pd.read_csv(uploaded_file)
-    st.subheader("Sample fused dataset (from uploaded file)")
-    st.dataframe(data.sample(6))
-else:
-    st.warning("Please upload your dataset CSV to continue.")
-    st.stop()
-
-features = [
-    "limestone_pct", "silica_pct", "al2o3_pct", "fe2o3_pct", "lsf",
-    "kiln_temp", "fuel_rate", "o2", "cooling_rate", "blaine", "mill_power"
+FEATURES: List[str] = [
+    "limestone_pct",
+    "silica_pct",
+    "al2o3_pct",
+    "fe2o3_pct",
+    "lsf",
+    "kiln_temp",
+    "fuel_rate",
+    "o2",
+    "cooling_rate",
+    "blaine",
+    "mill_power",
 ]
-target = "strength_28d"
+TARGET = "strength_28d"
+MODEL_PATH = Path(__file__).resolve().parent / "jk_quality_rf.joblib"
 
-missing_cols = [c for c in features + [target] if c not in data.columns]
-if missing_cols:
-    st.error(f"Missing required columns in your dataset: {missing_cols}")
-    st.stop()
 
-X = data[features]
-y = data[target]
+SLIDER_CONFIG: Dict[str, Dict[str, float]] = {
+    "limestone_pct": {"min": 70.0, "max": 90.0, "step": 0.1, "default": 80.0},
+    "silica_pct": {"min": 3.0, "max": 8.0, "step": 0.1, "default": 5.0},
+    "al2o3_pct": {"min": 1.0, "max": 3.5, "step": 0.1, "default": 2.0},
+    "fe2o3_pct": {"min": 1.0, "max": 3.0, "step": 0.1, "default": 2.0},
+    "kiln_temp": {"min": 1350.0, "max": 1500.0, "step": 1.0, "default": 1425.0},
+    "fuel_rate": {"min": 3.5, "max": 6.0, "step": 0.1, "default": 4.5},
+    "o2": {"min": 3.0, "max": 6.0, "step": 0.1, "default": 4.5},
+    "cooling_rate": {"min": 2.0, "max": 5.0, "step": 0.1, "default": 3.2},
+    "blaine": {"min": 280.0, "max": 360.0, "step": 1.0, "default": 320.0},
+    "mill_power": {"min": 1500.0, "max": 3500.0, "step": 10.0, "default": 2200.0},
+}
 
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=7)
-model_path = "jk_quality_rf.joblib"
 
-if not os.path.exists(model_path):
+class SimulationInputs(BaseModel):
+    limestone_pct: float = Field(..., ge=0)
+    silica_pct: float = Field(..., ge=0)
+    al2o3_pct: float = Field(..., ge=0)
+    fe2o3_pct: float = Field(..., ge=0)
+    kiln_temp: float
+    fuel_rate: float
+    o2: float = Field(..., ge=0, description="Oxygen percentage at kiln outlet")
+    cooling_rate: float
+    blaine: float
+    mill_power: float
+    lsf: Optional[float] = Field(None, description="Lime saturation factor. Optional; computed if missing.")
+    target_strength: Optional[float] = Field(
+        None,
+        description="Target 28-day strength to reach for recommendation messaging.",
+    )
+
+
+class ShapContribution(BaseModel):
+    feature: str
+    shap_value: float
+    actual_value: float
+
+
+class PredictionResponse(BaseModel):
+    predicted_strength: float
+    strength_units: str = "MPa"
+    quality_label: str
+    quality_color: str
+    delta_to_target: Optional[float]
+    shap_base_value: Optional[float]
+    shap_contributions: List[ShapContribution]
+    top_features: List[str]
+    suggestions: List[str]
+
+
+def _strength_classification(strength: float) -> Dict[str, str]:
+    if strength < 3:
+        return {"label": "Low / Substandard ⚠️", "color": "red"}
+    if 3 <= strength < 3.5:
+        return {"label": "Standard / Acceptable ✅", "color": "orange"}
+    if 4 <= strength < 4.5:
+        return {"label": "High / Good Quality", "color": "green"}
+    return {"label": "Very High / Excellent Quality 🌟", "color": "darkgreen"}
+
+
+def _load_artifacts() -> Dict[str, Optional[object]]:
+    if not MODEL_PATH.exists():
+        return {
+            "model": None,
+            "explainer": None,
+            "metrics": None,
+            "sample_data": None,
+            "background": None,
+        }
+
+    try:
+        artifact = joblib.load(MODEL_PATH)
+    except Exception:  # pragma: no cover - corrupt artifact fallback
+        return {
+            "model": None,
+            "explainer": None,
+            "metrics": None,
+            "sample_data": None,
+            "background": None,
+        }
+
+    if isinstance(artifact, RandomForestRegressor):
+        return {
+            "model": artifact,
+            "explainer": None,
+            "metrics": None,
+            "sample_data": None,
+            "background": None,
+        }
+
+    model: Optional[RandomForestRegressor] = artifact.get("model")
+    background = artifact.get("background")
+    metrics = artifact.get("metrics")
+    sample_data = artifact.get("sample_data")
+
+    explainer = None
+    if model is not None and background is not None:
+        explainer = shap.Explainer(model, background, feature_names=FEATURES)
+
+    return {
+        "model": model,
+        "explainer": explainer,
+        "metrics": metrics,
+        "sample_data": sample_data,
+        "background": background,
+    }
+
+
+app = FastAPI(
+    title="Cross-Process Quality Prediction API",
+    description="API that powers cement strength predictions, SHAP explanations, and operator guidance.",
+    version="2.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+STATE = _load_artifacts()
+
+
+def _compute_model(  # pragma: no cover - helper
+    df: pd.DataFrame,
+) -> Dict[str, object]:
+    missing_cols = [c for c in FEATURES + [TARGET] if c not in df.columns]
+    if missing_cols:
+        raise HTTPException(status_code=400, detail=f"Dataset missing required columns: {missing_cols}")
+
+    X = df[FEATURES]
+    y = df[TARGET]
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, shuffle=True, random_state=7
+    )
+
     model = RandomForestRegressor(n_estimators=200, random_state=7)
     model.fit(X_train, y_train)
-    joblib.dump(model, model_path)
-else:
-    model = joblib.load(model_path)
+
+    preds = model.predict(X_test)
+    metrics = {
+        "mae": float(mean_absolute_error(y_test, preds)),
+        "mse": float(mean_squared_error(y_test, preds)),
+        "r2": float(r2_score(y_test, preds)),
+    }
+
+    background = X_train.sample(min(200, len(X_train)), random_state=7)
+    explainer = shap.Explainer(model, background, feature_names=FEATURES)
+
+    sample_data = (
+        df.sample(min(6, len(df)), random_state=7)
+        .reset_index(drop=True)
+        .to_dict(orient="records")
+    )
+
+    artifact = {
+        "model": model,
+        "background": background,
+        "metrics": metrics,
+        "sample_data": sample_data,
+    }
+    joblib.dump(artifact, MODEL_PATH)
+
+    return {
+        "model": model,
+        "explainer": explainer,
+        "metrics": metrics,
+        "sample_data": sample_data,
+        "background": background,
+    }
 
 
-preds = model.predict(X_test)
-mae = mean_absolute_error(y_test, preds)
-mse = mean_squared_error(y_test, preds)
-r2 = r2_score(y_test, preds)
-st.markdown(f"**Model performance** — MAE: {mae:.3f} | MSE: {mse:.3f} | R²: {r2:.3f}")
+@app.post("/train")
+async def train(file: UploadFile = File(...)) -> Dict[str, object]:
+    if not file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Please upload a CSV file.")
+
+    contents = await file.read()
+    try:
+        df = pd.read_csv(io.BytesIO(contents))
+    except Exception as exc:  # pragma: no cover - pandas error
+        raise HTTPException(status_code=400, detail=f"Could not parse CSV: {exc}") from exc
+
+    global STATE
+    STATE = _compute_model(df)
+
+    response = {
+        "message": "Model trained successfully.",
+        "metrics": STATE["metrics"],
+        "feature_names": FEATURES,
+        "target_name": TARGET,
+        "sample_data": STATE["sample_data"],
+    }
+    return response
 
 
-st.sidebar.header("⚙️ Simulate Inputs from Different Silos")
-
-st.sidebar.subheader("Raw Mix Lab")
-lim = st.sidebar.slider("Limestone %", 70.0, 90.0, 80.0)
-sil = st.sidebar.slider("Silica %", 3.0, 8.0, 5.0)
-al = st.sidebar.slider("Al2O3 %", 1.0, 3.5, 2.0)
-fe = st.sidebar.slider("Fe2O3 %", 1.0, 3.0, 2.0)
-
-st.sidebar.subheader("Kiln")
-kt = st.sidebar.slider("Kiln Temp (°C)", 1350, 1500, 1425)
-fr = st.sidebar.slider("Fuel Rate (t/hr)", 3.5, 6.0, 4.5)
-o2v = st.sidebar.slider("O2 (%)", 3.0, 6.0, 4.5)
-cr = st.sidebar.slider("Cooling Rate", 2.0, 5.0, 3.2)
-
-st.sidebar.subheader("Grinding")
-bl = st.sidebar.slider("Blaine", 280, 360, 320)
-mp = st.sidebar.slider("Mill Power (kW)", 1500, 3500, 2200)
-
-input_df = pd.DataFrame([{
-    "limestone_pct": lim,
-    "silica_pct": sil,
-    "al2o3_pct": al,
-    "fe2o3_pct": fe,
-    "lsf": 0.8 * lim / 100,
-    "kiln_temp": kt,
-    "fuel_rate": fr,
-    "o2": o2v,
-    "cooling_rate": cr,
-    "blaine": bl,
-    "mill_power": mp,
-}])
-
-st.subheader("Predicted output for the given inputs")
-pred_val = model.predict(input_df)[0]
-st.metric("Predicted 28-day Strength (MPa)", f"{pred_val:.2f}")
+@app.get("/config")
+async def get_config() -> Dict[str, object]:
+    dataset_ready = STATE.get("model") is not None
+    return {
+        "features": FEATURES,
+        "target": TARGET,
+        "slider_config": SLIDER_CONFIG,
+        "dataset_ready": dataset_ready,
+        "metrics": STATE.get("metrics"),
+        "sample_data": STATE.get("sample_data"),
+    }
 
 
-if pred_val < 3:
-    quality = "Low / Substandard ⚠️"
-    color = "red"
-elif 3 <= pred_val < 3.5:
-    quality = "Standard / Acceptable ✅"
-    color = "orange"
-elif 4 <= pred_val < 4.5:
-    quality = "High / Good quality 💪"
-    color = "green"
-else:
-    quality = "Very High / Excellent quality 🌟"
-    color = "darkgreen"
-
-st.markdown(f"<span style='color:{color}; font-weight:bold'>Strength Interpretation: {quality}</span>", unsafe_allow_html=True)
+def _prepare_input(payload: SimulationInputs) -> Tuple[pd.DataFrame, Optional[float]]:
+    data = payload.dict()
+    target_strength = data.pop("target_strength", None)
+    if data.get("lsf") is None:
+        data["lsf"] = 0.8 * data["limestone_pct"] / 100
+    ordered_values = [data[feature] for feature in FEATURES]
+    input_df = pd.DataFrame([ordered_values], columns=FEATURES)
+    return input_df, target_strength
 
 
-st.subheader("Why the model predicted this (SHAP explanation)")
+@app.post("/predict", response_model=PredictionResponse)
+async def predict(payload: SimulationInputs) -> PredictionResponse:
+    model = STATE.get("model")
+    explainer = STATE.get("explainer")
+    if model is None:
+        raise HTTPException(status_code=400, detail="Model not trained. Upload a dataset via /train first.")
 
-@st.cache_resource(hash_funcs={RandomForestRegressor: lambda _: None})
-def get_explainer(model):
-    return shap.Explainer(model)
+    input_df, target_strength = _prepare_input(payload)
+    prediction = float(model.predict(input_df)[0])
 
-expl = get_explainer(model)
-shap_input = expl(input_df)
+    quality = _strength_classification(prediction)
+    delta_to_target = None
+    if target_strength is not None:
+        delta_to_target = float(np.round(target_strength - prediction, 4))
 
-fig1, ax1 = plt.subplots(figsize=(6, 4))
-shap.plots.waterfall(shap_input[0], show=False)
-st.pyplot(fig1)
-st.write("""
-The SHAP explanation shows how each input feature contributed to the predicted 28-day cement strength. 
-Positive (Red) SHAP values increase predicted strength; negative (Blue) values reduce it. 
-Top influencing features help operators adjust parameters to achieve target strength.
-""")
+    shap_contributions: List[ShapContribution] = []
+    top_features: List[str] = []
+    shap_base_value: Optional[float] = None
+    suggestions: List[str] = []
+
+    if explainer is not None:
+        explanation = explainer(input_df)
+        shap_base_value = float(np.array(explanation.base_values).flatten()[0])
+        shap_values = explanation.values[0]
+        contributions: List[ShapContribution] = []
+        for feature, shap_value in zip(FEATURES, shap_values):
+            contributions.append(
+                ShapContribution(
+                    feature=feature,
+                    shap_value=float(shap_value),
+                    actual_value=float(input_df.iloc[0][feature]),
+                )
+            )
+        shap_contributions = contributions
+        sorted_contributions = sorted(
+            contributions,
+            key=lambda item: abs(item.shap_value),
+            reverse=True,
+        )
+        top_features = [item.feature for item in sorted_contributions[:3]]
+
+        for item in sorted_contributions[:3]:
+            action = "Decrease" if item.shap_value > 0 else "Increase"
+            suggestions.append(f"{action} {item.feature}")
+
+    response = PredictionResponse(
+        predicted_strength=float(np.round(prediction, 4)),
+        quality_label=quality["label"],
+        quality_color=quality["color"],
+        delta_to_target=delta_to_target,
+        shap_base_value=shap_base_value,
+        shap_contributions=shap_contributions,
+        top_features=top_features,
+        suggestions=suggestions,
+    )
+    return response
 
 
-st.subheader("Simple AI suggestion to reach a target strength")
-
-target_strength = st.number_input("Target 28-day Strength (MPa)", value=float(pred_val + 0.5))
-delta = target_strength - pred_val
-
-expl_local = expl(input_df)
-shap_series = pd.Series(expl_local.values[0], index=features)
-top_features = shap_series.abs().sort_values(ascending=False).index[:3]
-
-suggestions = []
-for f in top_features:
-    sign = np.sign(shap_series[f])
-    if sign < 0:
-        act = f"Increase {f}"
-    else:
-        act = f"Decrease {f}"
-    suggestions.append(act)
-
-st.write("Top features influencing prediction:", list(top_features))
-st.info("Suggested changes (manual operator guidance):")
-for s in suggestions:
-    st.write("•", s)
-
-
-
+@app.get("/health")
+async def healthcheck() -> Dict[str, str]:
+    status = "ready" if STATE.get("model") else "waiting_for_data"
+    return {"status": status}
